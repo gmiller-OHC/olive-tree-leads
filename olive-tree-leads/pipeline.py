@@ -3,8 +3,8 @@ pipeline.py — Fetches residential properties from OpenStreetMap, geocodes
 existing customers, scores every lead, and writes results to Supabase.
 
 Run modes:
-  python pipeline.py setup   → first-time: load customers, geocode, fetch leads
-  python pipeline.py refresh → daily: re-score existing leads + fetch new ones
+  python pipeline.py setup   → first-time: geocode customers + fetch leads
+  python pipeline.py refresh → daily: geocode any new customers + fetch leads
 """
 
 import requests
@@ -13,6 +13,7 @@ import math
 import logging
 import sys
 import os
+import pathlib
 
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
@@ -27,10 +28,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Service area bounding box (Tobermory → Kincardine → Owen Sound) ───────────
-BBOX = dict(min_lat=44.0, max_lat=45.4, min_lon=-82.0, max_lon=-80.6)
+BASE_DIR = pathlib.Path(__file__).parent
 
-# Municipalities we care about — used to filter out-of-area OSM results
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+# ── Chunked bounding boxes to avoid Overpass timeouts ─────────────────────────
+# Breaking the service area into 4 smaller zones
+BBOX_CHUNKS = [
+    # (min_lat, min_lon, max_lat, max_lon, label)
+    (44.00, -82.00, 44.45, -81.20, "South Bruce - Kincardine/Tiverton/Paisley"),
+    (44.40, -81.70, 44.85, -81.00, "Central - Port Elgin/Southampton/Wiarton"),
+    (44.75, -81.80, 45.40, -81.00, "North Peninsula - Lion's Head/Tobermory"),
+    (44.40, -81.10, 44.85, -80.60, "East - Owen Sound/Meaford/Chatsworth"),
+]
+
 SERVICE_CITIES = {
     "port elgin", "southampton", "kincardine", "owen sound", "wiarton",
     "tobermory", "tiverton", "paisley", "chesley", "tara", "allenford",
@@ -38,58 +49,74 @@ SERVICE_CITIES = {
     "elmwood", "holyrood", "saugeen shores", "lion's head", "lions head",
     "sauble beach", "hepworth", "shallow lake", "mar", "desboro", "hanover",
     "durham", "georgian bluffs", "south bruce peninsula", "arran-elderslie",
+    "bruce peninsula", "northern bruce peninsula",
 }
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
+# ── Overpass fetching with retry ───────────────────────────────────────────────
 
-# ── Property data from OpenStreetMap ─────────────────────────────────────────
-
-def fetch_properties_overpass() -> list[dict]:
-    """Fetch all addressed residential nodes/ways in the bounding box."""
+def fetch_chunk(min_lat, min_lon, max_lat, max_lon, label, retries=3) -> list:
+    """Fetch one geographic chunk from Overpass with retry logic."""
     query = f"""
-    [out:json][timeout:180];
+    [out:json][timeout:60];
     (
       node["addr:housenumber"]["addr:street"]
-          ({BBOX['min_lat']},{BBOX['min_lon']},{BBOX['max_lat']},{BBOX['max_lon']});
+          ({min_lat},{min_lon},{max_lat},{max_lon});
       way["addr:housenumber"]["addr:street"]
-          ({BBOX['min_lat']},{BBOX['min_lon']},{BBOX['max_lat']},{BBOX['max_lon']});
+          ({min_lat},{min_lon},{max_lat},{max_lon});
     );
     out center;
     """
-    logger.info("Querying Overpass API for service-area properties...")
-    try:
-        resp = requests.post(OVERPASS_URL, data={"data": query}, timeout=200)
-        resp.raise_for_status()
-        elements = resp.json().get("elements", [])
-        logger.info(f"Overpass returned {len(elements):,} elements")
-        return elements
-    except Exception as exc:
-        logger.error(f"Overpass error: {exc}")
-        return []
+    for attempt in range(1, retries + 1):
+        try:
+            logger.info(f"  Fetching chunk: {label} (attempt {attempt})")
+            resp = requests.post(
+                OVERPASS_URL,
+                data={"data": query},
+                timeout=90,
+            )
+            resp.raise_for_status()
+            elements = resp.json().get("elements", [])
+            logger.info(f"  ✓ {label}: {len(elements)} elements")
+            return elements
+        except Exception as exc:
+            logger.warning(f"  ✗ Attempt {attempt} failed: {exc}")
+            if attempt < retries:
+                wait = attempt * 15
+                logger.info(f"  Waiting {wait}s before retry...")
+                time.sleep(wait)
+    logger.error(f"  All retries failed for chunk: {label}")
+    return []
+
+
+def fetch_properties_overpass() -> list[dict]:
+    """Fetch all chunks and combine results."""
+    all_elements = []
+    for chunk in BBOX_CHUNKS:
+        min_lat, min_lon, max_lat, max_lon, label = chunk
+        elements = fetch_chunk(min_lat, min_lon, max_lat, max_lon, label)
+        all_elements.extend(elements)
+        if len(BBOX_CHUNKS) > 1:
+            time.sleep(5)  # be polite to Overpass between chunks
+    logger.info(f"Total elements fetched: {len(all_elements):,}")
+    return all_elements
 
 
 def parse_overpass_elements(elements: list) -> list[dict]:
-    """Convert raw OSM elements into clean address records."""
-    # Building types we skip (not residential)
     skip_buildings = {
         "commercial", "industrial", "retail", "office", "school", "hospital",
         "church", "garage", "shed", "storage", "barn", "greenhouse", "carport",
     }
-
     records = []
+    seen_addresses = set()
+
     for el in elements:
         tags = el.get("tags", {})
-
-        # Skip non-residential building types
         if tags.get("building", "").lower() in skip_buildings:
             continue
-
-        # Skip if tagged as amenity / shop / office (not a home)
         if tags.get("amenity") or tags.get("shop") or tags.get("office"):
             continue
 
-        # Coordinates
         if el["type"] == "node":
             lat, lng = el.get("lat"), el.get("lon")
         elif el["type"] == "way":
@@ -109,11 +136,15 @@ def parse_overpass_elements(elements: list) -> list[dict]:
         if not number or not street:
             continue
 
-        # Filter to service area cities
         if city and city.lower() not in SERVICE_CITIES:
-            continue  # outside service area — skip
+            continue
 
         address = f"{number} {street}, {city}, Ontario, Canada".strip(", ")
+
+        # Deduplicate
+        if address in seen_addresses:
+            continue
+        seen_addresses.add(address)
 
         records.append({
             "address":    address,
@@ -124,12 +155,11 @@ def parse_overpass_elements(elements: list) -> list[dict]:
             "start_date": tags.get("start_date", ""),
         })
 
-    logger.info(f"Parsed {len(records):,} residential addresses")
+    logger.info(f"Parsed {len(records):,} unique residential addresses")
     return records
 
 
-def extract_year_built(start_date_str: str) -> int | None:
-    """Pull a 4-digit year out of an OSM start_date string."""
+def extract_year_built(start_date_str: str):
     import re
     if not start_date_str:
         return None
@@ -140,7 +170,6 @@ def extract_year_built(start_date_str: str) -> int | None:
 # ── Customer geocoding ─────────────────────────────────────────────────────────
 
 def geocode_customers(batch: int = 100):
-    """Geocode any customers that don't yet have lat/lng coordinates."""
     geolocator = Nominatim(user_agent="olive_tree_exteriors_lead_machine")
     geocode    = RateLimiter(geolocator.geocode, min_delay_seconds=1.2)
 
@@ -165,7 +194,6 @@ def geocode_customers(batch: int = 100):
                 )
                 db.update_customer_geocode(row["id"], loc.latitude, loc.longitude, city)
                 success += 1
-                logger.debug(f"  ✓ {addr[:60]}")
         except Exception as exc:
             logger.warning(f"  ✗ {addr[:60]} — {exc}")
 
@@ -174,20 +202,7 @@ def geocode_customers(batch: int = 100):
 
 # ── Lead scoring ───────────────────────────────────────────────────────────────
 
-def score_lead(
-    lat: float,
-    lng: float,
-    customer_coords: list[dict],
-    year_built: int | None = None,
-) -> tuple[float, float | None]:
-    """
-    Return (score 0-100, nearest_customer_metres).
-
-    Scoring weights:
-      Proximity to existing customers  — up to +35 pts
-      Home age (prime window 1975-2005) — up to +20 pts
-      Base                              — 50 pts
-    """
+def score_lead(lat, lng, customer_coords, year_built=None):
     score = 50.0
     nearest_m = None
 
@@ -224,76 +239,62 @@ def score_lead(
     return min(100.0, max(0.0, score)), nearest_m
 
 
-def is_existing_customer(lat: float, lng: float, customer_coords: list[dict],
-                          threshold_m: float = 40.0) -> bool:
-    """True if this property is within threshold_m of a known customer."""
+def is_existing_customer(lat, lng, customer_coords, threshold_m=40.0):
     return any(
         geodist((lat, lng), (c["lat"], c["lng"])).meters < threshold_m
         for c in customer_coords
     )
 
 
-# ── Main pipeline functions ────────────────────────────────────────────────────
+# ── Main pipeline ──────────────────────────────────────────────────────────────
 
 def refresh_leads():
-    """Fetch properties from OSM, score them, write to Supabase."""
     customers = db.get_all_customers_geocoded()
     logger.info(f"Loaded {len(customers)} geocoded customers as reference points")
 
     elements = fetch_properties_overpass()
     if not elements:
-        logger.error("No elements from Overpass — aborting refresh")
+        logger.error("No elements from Overpass — aborting")
         return
 
     records = parse_overpass_elements(elements)
-
-    updated      = 0
-    skipped_biz  = 0
+    updated = 0
+    skipped = 0
 
     for rec in records:
         lat, lng = rec["lat"], rec["lng"]
-
-        # Skip if it's an existing customer's address
         if is_existing_customer(lat, lng, customers):
-            skipped_biz += 1
+            skipped += 1
             continue
-
         year_built = extract_year_built(rec.get("start_date", ""))
         score, nearest_m = score_lead(lat, lng, customers, year_built)
-
         db.upsert_lead(
-            address         = rec["address"],
-            lat             = lat,
-            lng             = lng,
-            city            = rec["city"],
-            postal_code     = rec["postal_code"],
-            score           = score,
+            address            = rec["address"],
+            lat                = lat,
+            lng                = lng,
+            city               = rec["city"],
+            postal_code        = rec["postal_code"],
+            score              = score,
             nearest_customer_m = nearest_m,
         )
         updated += 1
-
         if updated % 500 == 0:
-            logger.info(f"  …{updated:,} leads written so far")
+            logger.info(f"  …{updated:,} leads written")
 
-    logger.info(
-        f"Pipeline complete — {updated:,} leads upserted, "
-        f"{skipped_biz} existing-customer addresses skipped"
-    )
+    logger.info(f"Done — {updated:,} leads upserted, {skipped} customer addresses skipped")
 
 
 def run_setup():
-    """One-time setup: load customer CSV → geocode → fetch leads."""
+    """Setup: geocode customers (loaded via Supabase dashboard) then fetch leads."""
     logger.info("=== SETUP MODE ===")
-    db.load_customers_from_csv("data/customers.csv")
     geocode_customers(batch=400)
     refresh_leads()
     logger.info("=== SETUP COMPLETE ===")
 
 
 def run_daily_refresh():
-    """Daily job: geocode any new customers, then re-score all leads."""
     logger.info("=== DAILY REFRESH ===")
-    geocode_customers(batch=50)   # pick up any newly-added customers
+    geocode_customers(batch=50)
     refresh_leads()
     logger.info("=== DAILY REFRESH COMPLETE ===")
 
